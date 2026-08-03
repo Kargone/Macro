@@ -1,0 +1,148 @@
+{
+  "sessions": [
+    {
+      "id": "2eea345c",
+      "name": "Farming Macro: Mushrooms",
+      "recorded_at": "2026-08-01 17:48:36",
+      "event_count": 16,
+      "events": [
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 56550.849714279175,
+          "interval_ms": 246.2027072906494
+        },
+        {
+          "event": "key",
+          "key": "s",
+          "special": false,
+          "hold_ms": 56028.58757972717,
+          "interval_ms": -48.6903190612793
+        },
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 57157.86747932434,
+          "interval_ms": -129.3187141418457
+        },
+        {
+          "event": "key",
+          "key": "s",
+          "special": false,
+          "hold_ms": 55843.38879585266,
+          "interval_ms": 132.95269012451172
+        },
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 57010.17003059387,
+          "interval_ms": 7.26628303527832
+        },
+        {
+          "event": "key",
+          "key": "s",
+          "special": false,
+          "hold_ms": 55959.77425575256,
+          "interval_ms": -55.32050132751465
+        },
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 57045.442390441895,
+          "interval_ms": -83.97507667541504
+        },
+        {
+          "event": "key",
+          "key": "s",
+          "special": false,
+          "hold_ms": 56015.989542007446,
+          "interval_ms": -71.9611644744873
+        },
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 57223.20251464844,
+          "interval_ms": -228.11293601989746
+        },
+        {
+          "event": "key",
+          "key": "s",
+          "special": false,
+          "hold_ms": 55864.42518234253,
+          "interval_ms": -36.99135780334473
+        },
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 57039.248275756836,
+          "interval_ms": -44.1288948059082
+        },
+        {
+          "event": "key",
+          "key": "s",
+          "special": false,
+          "hold_ms": 56023.431062698364,
+          "interval_ms": -36.87739372253418
+        },
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 57340.81034660339,
+          "interval_ms": -120.01466751098633
+        },
+        {
+          "event": "key",
+          "key": "s",
+          "special": false,
+          "hold_ms": 64579.99229431152,
+          "interval_ms": -50.39548873901367
+        },
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 995.5439567565918,
+          "interval_ms": -16.169071197509766
+        },
+        {
+          "event": "click",
+          "button": "left",
+          "x": 1280.0,
+          "y": 817.0,
+          "hold_ms": 800000.0595741272,
+          "interval_ms": -800130.5411052704
+        }
+      ]
+    },
+    {
+      "id": "7129ec08",
+      "name": "test",
+      "recorded_at": "2026-08-01 17:41:08",
+      "event_count": 2,
+      "events": [
+        {
+          "event": "key",
+          "key": "w",
+          "special": false,
+          "hold_ms": 8914.055824279785,
+          "interval_ms": 1374.5598793029785
+        },
+        {
+          "event": "click",
+          "button": "left",
+          "x": 1280.0,
+          "y": 817.0,
+          "hold_ms": 9632.059574127197,
+          "interval_ms": -9360.541105270386
+        }
+      ]
+    }
+  ]
+}

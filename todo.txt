@@ -1,0 +1,6 @@
+- fix the folder in folder for the app
+- git commit
+
+- weird error with the first line switching in the mushroom farm idk why
+- another erorr with the clicking, if you arent safe with it it wont record it
+- 
