@@ -41,9 +41,7 @@ pip install pynput
 
 To run the application silently in the background on Windows without an annoying command prompt window popup:
 
-1. Rename the generated `launcher.txt` to `run_macro.bat`.
-2. Double-click `run_macro.bat` to launch the application.
-3. This utilizes `run_macro.vbs` to launch `pythonw.exe` completely invisibly!
+1. Double-click `run_app.pyw` to launch the application.
 
 ### 3. Manual Launch
 
