@@ -1,2 +1,11 @@
-- weird error with the first line switching in the mushroom farm idk why
-- another erorr with the clicking, if you arent safe with it it wont record it
+- Ctrl+V paste confirmed working - thanks for testing!
+- Re-record (or re-test) any multi-monitor mouse movement in "Scripture Notes" now that the DPI-awareness fix is in - the cursor-off-screen/stuck bug should be gone, but the coordinates you just recorded were captured before the fix and may still be off on your second screen
+- Confirm mouse movement across BOTH monitors now lands in the right spot on playback (not just the monitor the app window itself is on)
+- Found why the diagnostic script didn't show the cursor-jump bug but the real app did: run_app.pyw (your actual launcher) had its own separate, unfixed copy of the old DPI-awareness code, so the earlier DPI fix never applied to it. Now fixed there too - please re-test the cursor jump using run_app.pyw specifically (not `python macro_app.py`, not the diagnostic script) and confirm it's actually gone
+- If it's still not fixed after this, re-run diagnose_cursor_jump.py (it doesn't have the bug, so use it as a baseline) and cross-check against a run_app.pyw run to spot any other difference between the two entry points
+- Test Loop Playback with a fixed repeat count (e.g. 3) - confirm it plays exactly that many times then stops on its own
+- Test Loop Playback set to infinite (0) - confirm F10 stops it mid-loop
+- Test the new "Raw Input Delta (games / FPS camera)" mouse mode in Minecraft: record a camera turn, play it back, confirm the in-game camera actually moves
+- If the in-game camera moves too much/too little on playback, compare against Minecraft's mouse sensitivity setting - raw deltas may need retuning
+- Record a macro that includes an unusual Ctrl combo (e.g. Ctrl+1 or Ctrl+=) and confirm recording keeps working normally afterward instead of silently stopping
+- General regression check: record and play a normal macro (regular keys + mouse clicks) to confirm nothing else broke

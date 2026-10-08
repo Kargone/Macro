@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Personal recordings and diagnostic output
+macro_recordings.json
+macro_recordings.json.tmp
+macro_recordings.json.corrupt-*
+cursor_jump_log.csv

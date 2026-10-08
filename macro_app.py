@@ -3,12 +3,146 @@ import sys
 import json
 import time
 import uuid
+import ctypes
+from ctypes import wintypes
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
 # Import pynput for global hooks and controller emulation
 import pynput
+
+
+# ==================== RAW MOUSE INPUT (WINDOWS) ====================
+# Games with a camera/look control (Minecraft included) hide the cursor and
+# read relative HID mouse deltas via the raw input API, ignoring the OS
+# cursor's absolute screen position entirely. pynput's mouse listener only
+# ever sees the (often clipped/motionless) cursor position, so it cannot
+# capture camera-look movement in such games. To support that, we register
+# for WM_INPUT messages directly against the app's own window and read the
+# raw relative deltas out of each RAWINPUT packet.
+
+GWLP_WNDPROC = -4
+WM_INPUT = 0x00FF
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+RIDEV_INPUTSINK = 0x00000100
+HID_USAGE_PAGE_GENERIC = 0x01
+HID_USAGE_GENERIC_MOUSE = 0x02
+MOUSE_MOVE_ABSOLUTE = 0x01
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [
+        ("usUsagePage", wintypes.USHORT),
+        ("usUsage", wintypes.USHORT),
+        ("dwFlags", wintypes.DWORD),
+        ("hwndTarget", wintypes.HWND),
+    ]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [
+        ("dwType", wintypes.DWORD),
+        ("dwSize", wintypes.DWORD),
+        ("hDevice", wintypes.HANDLE),
+        ("wParam", wintypes.WPARAM),
+    ]
+
+
+class RAWMOUSE(ctypes.Structure):
+    # usButtonFlags/usButtonData live in a ULONG-aligned union in the real
+    # Win32 struct, so there are 2 bytes of padding after usFlags.
+    _fields_ = [
+        ("usFlags", wintypes.USHORT),
+        ("_padding", wintypes.USHORT),
+        ("usButtonFlags", wintypes.USHORT),
+        ("usButtonData", wintypes.USHORT),
+        ("ulRawButtons", wintypes.ULONG),
+        ("lLastX", wintypes.LONG),
+        ("lLastY", wintypes.LONG),
+        ("ulExtraInformation", wintypes.ULONG),
+    ]
+
+
+class RAWINPUT(ctypes.Structure):
+    _fields_ = [
+        ("header", RAWINPUTHEADER),
+        ("mouse", RAWMOUSE),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    # MOUSEINPUT is the largest member of the real INPUT union, so a mouse-only
+    # struct has the same size (40 bytes on 64-bit) that SendInput checks for.
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("mi", MOUSEINPUT),
+    ]
+
+
+# 64-bit-safe signatures. Getting these wrong truncates pointers on 64-bit
+# Windows and reliably crashes the whole process, so they are set explicitly
+# rather than relying on ctypes' 32-bit default of c_int.
+_user32 = ctypes.windll.user32
+_user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+_user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+_user32.CallWindowProcW.restype = ctypes.c_ssize_t
+_user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_user32.RegisterRawInputDevices.restype = wintypes.BOOL
+_user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT]
+_user32.GetRawInputData.restype = wintypes.UINT
+_user32.GetRawInputData.argtypes = [wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(wintypes.UINT), wintypes.UINT]
+
+_user32.SendInput.restype = wintypes.UINT
+_user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+
+def send_relative_mouse_move(dx, dy):
+    """Inject a relative mouse move through SendInput. Unlike SetCursorPos
+    (which pynput's move() uses), this produces real WM_INPUT deltas, which
+    is what raw-input games like Minecraft read for camera look."""
+    inp = INPUT(type=INPUT_MOUSE, mi=MOUSEINPUT(dx=int(dx), dy=int(dy), dwFlags=MOUSEEVENTF_MOVE))
+    if _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) != 1:
+        raise ctypes.WinError()
+
+
+def set_dpi_awareness():
+    """Per-Monitor-V2 DPI awareness keeps absolute cursor coordinates
+    consistent across monitors that have different scaling factors. The
+    older PROCESS_SYSTEM_DPI_AWARE level interprets/reports coordinates
+    relative to whichever monitor was primary at process startup, so on a
+    multi-monitor setup with mixed scaling, both the recorded coordinates and
+    SetCursorPos-based playback drift off target (or off-screen entirely).
+    Must be called before the Tk window is created. Every launcher calls this
+    one function so the entry points can't drift apart again."""
+    try:
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+        if not ctypes.windll.user32.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2):
+            raise OSError("SetProcessDpiAwarenessContext failed")
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
 
 
 class PlaybackController:
@@ -30,6 +164,8 @@ class PlaybackController:
         self.timeline_idx = 0
         self.playback_elapsed_s = 0.0
         self.playback_start_real_time = 0.0
+        self.loop_count = 1
+        self.loop_iteration = 1
 
         # Track currently held keys/buttons to prevent sticking on abort/stop
         self.simulated_pressed_keys = set()
@@ -42,14 +178,29 @@ class PlaybackController:
         # Fast lookup from event object to index in original list
         self.event_index_map = {}
 
-    def start(self, events, speed_multiplier=1.0):
+        # Held while injecting an action and while stop/pause release held
+        # inputs, so the playback thread can never press a key just after
+        # stop() released everything (leaving it stuck down).
+        self.input_lock = threading.Lock()
+
+        # Bumped on every start() so a finished thread's queued stop can't
+        # end a newer playback that started in the meantime.
+        self.generation = 0
+
+    def start(self, events, speed_multiplier=1.0, loop_count=1):
         if self.playing:
             return
 
+        self.generation += 1
         self.playing = True
         self.paused = False
         self.stop_event.clear()
         self.pause_event.set()
+
+        # loop_count: 1 = play once (default), 0 = loop indefinitely until
+        # stopped, N>1 = repeat the full sequence N times total.
+        self.loop_count = loop_count
+        self.loop_iteration = 1
 
         self.simulated_pressed_keys.clear()
         self.simulated_pressed_buttons.clear()
@@ -60,25 +211,37 @@ class PlaybackController:
         self.event_index_map = {id(ev): i for i, ev in enumerate(events)}
 
         # 1. Reconstruct the absolute timeline of discrete actions
+        # Prefer absolute timestamps for overlap-safe playback. Fall back to legacy interval/hold.
         self.timeline = []
         current_time_s = 0.0
         for ev in events:
-            interval_s = ev.get("interval_ms", 0.0) / 1000.0
             event_type = ev.get("event")
+            has_abs_hold = "start_ms" in ev and "end_ms" in ev
+            has_abs_move = "time_ms" in ev
 
-            if event_type == "move":
-                # Instanstaneous move event
-                start_s = current_time_s + interval_s
+            if event_type in ("move", "raw_move"):
+                if has_abs_move:
+                    start_s = max(0.0, ev.get("time_ms", 0.0) / 1000.0)
+                else:
+                    interval_s = ev.get("interval_ms", 0.0) / 1000.0
+                    # Legacy move scheduling
+                    start_s = current_time_s + interval_s
+
                 self.timeline.append({
                     "time": start_s,
-                    "action": "move",
+                    "action": event_type,
                     "event": ev
                 })
-                current_time_s = start_s
+                current_time_s = max(current_time_s, start_s)
             else:
-                hold_s = ev.get("hold_ms", 0.0) / 1000.0
-                start_s = current_time_s + interval_s
-                end_s = start_s + hold_s
+                if has_abs_hold:
+                    start_s = max(0.0, ev.get("start_ms", 0.0) / 1000.0)
+                    end_s = max(start_s, ev.get("end_ms", 0.0) / 1000.0)
+                else:
+                    interval_s = ev.get("interval_ms", 0.0) / 1000.0
+                    hold_s = ev.get("hold_ms", 0.0) / 1000.0
+                    start_s = current_time_s + interval_s
+                    end_s = start_s + hold_s
 
                 self.timeline.append({
                     "time": start_s,
@@ -90,7 +253,7 @@ class PlaybackController:
                     "action": "release",
                     "event": ev
                 })
-                current_time_s = end_s
+                current_time_s = max(current_time_s, end_s)
 
         # Sort actions. Presses occur before releases if timestamps are identical
         self.timeline.sort(key=lambda x: (x["time"], 1 if x["action"] == "release" else 0))
@@ -101,7 +264,7 @@ class PlaybackController:
 
         self.thread = threading.Thread(
             target=self._playback_loop,
-            args=(events, speed_multiplier),
+            args=(events, speed_multiplier, self.generation),
             daemon=True
         )
         self.thread.start()
@@ -109,131 +272,171 @@ class PlaybackController:
     def pause(self):
         if not self.playing or self.paused:
             return
-        self.paused = True
-        self.pause_event.clear()
-        # Capture precise playback duration elapsed up to this pause event
-        self.playback_elapsed_s += (time.time() - self.playback_start_real_time)
+        with self.input_lock:
+            self.paused = True
+            self.pause_event.clear()
+            # Capture precise playback duration elapsed up to this pause event
+            self.playback_elapsed_s += (time.time() - self.playback_start_real_time)
 
-        # Capture and release currently held simulated keys/buttons so they don't bleed during pause
-        self.paused_pressed_keys = list(self.simulated_pressed_keys)
-        self.paused_pressed_buttons = list(self.simulated_pressed_buttons)
+            # Capture and release currently held simulated keys/buttons so they don't bleed during pause
+            self.paused_pressed_keys = list(self.simulated_pressed_keys)
+            self.paused_pressed_buttons = list(self.simulated_pressed_buttons)
 
-        for key in self.paused_pressed_keys:
-            try:
-                self.keyboard_controller.release(key)
-                self.simulated_pressed_keys.discard(key)
-            except Exception:
-                pass
+            for key in self.paused_pressed_keys:
+                try:
+                    self.keyboard_controller.release(key)
+                    self.simulated_pressed_keys.discard(key)
+                except Exception:
+                    pass
 
-        for btn in self.paused_pressed_buttons:
-            try:
-                self.mouse_controller.release(btn)
-                self.simulated_pressed_buttons.discard(btn)
-            except Exception:
-                pass
+            for btn in self.paused_pressed_buttons:
+                try:
+                    self.mouse_controller.release(btn)
+                    self.simulated_pressed_buttons.discard(btn)
+                except Exception:
+                    pass
 
         self.app.on_playback_paused()
 
     def resume(self):
         if not self.playing or not self.paused:
             return
-        self.paused = False
+        with self.input_lock:
+            self.paused = False
 
-        # Restore pre-pause key and mouse hold states
-        for key in self.paused_pressed_keys:
-            try:
-                self.keyboard_controller.press(key)
-                self.simulated_pressed_keys.add(key)
-            except Exception:
-                pass
+            # Restore pre-pause key and mouse hold states
+            for key in self.paused_pressed_keys:
+                try:
+                    self.keyboard_controller.press(key)
+                    self.simulated_pressed_keys.add(key)
+                except Exception:
+                    pass
 
-        for btn in self.paused_pressed_buttons:
-            try:
-                self.mouse_controller.press(btn)
-                self.simulated_pressed_buttons.add(btn)
-            except Exception:
-                pass
+            for btn in self.paused_pressed_buttons:
+                try:
+                    self.mouse_controller.press(btn)
+                    self.simulated_pressed_buttons.add(btn)
+                except Exception:
+                    pass
 
-        self.paused_pressed_keys = []
-        self.paused_pressed_buttons = []
+            self.paused_pressed_keys = []
+            self.paused_pressed_buttons = []
 
-        self.pause_event.set()
-        self.playback_start_real_time = time.time()
+            self.playback_start_real_time = time.time()
+            self.pause_event.set()
         self.app.on_playback_resumed()
 
     def stop(self):
         if not self.playing:
             return
-        self.playing = False
-        self.paused = False
-        self.stop_event.set()
-        self.pause_event.set()
+        with self.input_lock:
+            self.playing = False
+            self.paused = False
+            self.stop_event.set()
+            self.pause_event.set()
 
-        # Safe release of any stuck keys/mouse buttons
-        for key in list(self.simulated_pressed_keys):
-            try:
-                self.keyboard_controller.release(key)
-            except Exception:
-                pass
-        self.simulated_pressed_keys.clear()
+            # Safe release of any stuck keys/mouse buttons
+            for key in list(self.simulated_pressed_keys):
+                try:
+                    self.keyboard_controller.release(key)
+                except Exception:
+                    pass
+            self.simulated_pressed_keys.clear()
 
-        for btn in list(self.simulated_pressed_buttons):
-            try:
-                self.mouse_controller.release(btn)
-            except Exception:
-                pass
-        self.simulated_pressed_buttons.clear()
+            for btn in list(self.simulated_pressed_buttons):
+                try:
+                    self.mouse_controller.release(btn)
+                except Exception:
+                    pass
+            self.simulated_pressed_buttons.clear()
 
-        self.paused_pressed_keys = []
-        self.paused_pressed_buttons = []
+            self.paused_pressed_keys = []
+            self.paused_pressed_buttons = []
 
         self.app.on_playback_stopped()
 
-    def _playback_loop(self, events, speed_multiplier):
+    def _finish(self, generation):
+        # Queued by the playback thread when it ends; ignore it if a newer
+        # playback has already been started.
+        if generation == self.generation:
+            self.stop()
+
+    def _playback_loop(self, events, speed_multiplier, generation):
         n_actions = len(self.timeline)
 
-        while self.timeline_idx < n_actions and not self.stop_event.is_set():
-            if self.paused:
-                self.pause_event.wait()
-                if self.stop_event.is_set():
-                    break
-                continue
+        while True:
+            while self.timeline_idx < n_actions and not self.stop_event.is_set():
+                if self.paused:
+                    self.pause_event.wait()
+                    if self.stop_event.is_set():
+                        break
+                    continue
 
-            action = self.timeline[self.timeline_idx]
-            scheduled_time_s = action["time"] / speed_multiplier
+                action = self.timeline[self.timeline_idx]
+                scheduled_time_s = action["time"] / speed_multiplier
 
-            # Calculate current total elapsed time (accumulated before pause + current session)
-            real_elapsed = time.time() - self.playback_start_real_time
-            total_elapsed_s = self.playback_elapsed_s + real_elapsed
+                # Calculate current total elapsed time (accumulated before pause + current session)
+                real_elapsed = time.time() - self.playback_start_real_time
+                total_elapsed_s = self.playback_elapsed_s + real_elapsed
 
-            remaining_s = scheduled_time_s - total_elapsed_s
+                remaining_s = scheduled_time_s - total_elapsed_s
 
-            if remaining_s > 0:
-                # Hybrid sleep: coarse sleep, then busy-wait for sub-ms precision
-                if remaining_s > 0.01:
-                    time.sleep(0.01)
-                else:
-                    while remaining_s > 0 and not self.stop_event.is_set() and not self.paused:
-                        real_elapsed = time.time() - self.playback_start_real_time
-                        total_elapsed_s = self.playback_elapsed_s + real_elapsed
-                        remaining_s = scheduled_time_s - total_elapsed_s
-                continue
+                if remaining_s > 0:
+                    # Hybrid sleep: coarse sleep, then busy-wait for sub-ms precision
+                    if remaining_s > 0.01:
+                        time.sleep(0.01)
+                    else:
+                        while remaining_s > 0 and not self.stop_event.is_set() and not self.paused:
+                            real_elapsed = time.time() - self.playback_start_real_time
+                            total_elapsed_s = self.playback_elapsed_s + real_elapsed
+                            remaining_s = scheduled_time_s - total_elapsed_s
+                    continue
 
-            # Execute action
-            self._execute_action(action)
-            self.timeline_idx += 1
+                # Execute action. Re-check stop/pause under the lock: either
+                # may have fired while we were waiting, and pressing now would
+                # leave the input held after they released everything.
+                with self.input_lock:
+                    if self.stop_event.is_set():
+                        break
+                    if self.paused:
+                        continue
+                    self._execute_action(action)
+                    self.timeline_idx += 1
 
-            # Highlight event row in GUI using precomputed index
-            try:
-                ev_id = id(action["event"])
-                orig_idx = self.event_index_map.get(ev_id, None)
-                if orig_idx is not None:
-                    self.app.root.after(0, self.app.highlight_event, orig_idx)
-            except Exception:
-                pass
+                # Highlight event row in GUI using precomputed index
+                try:
+                    ev_id = id(action["event"])
+                    orig_idx = self.event_index_map.get(ev_id, None)
+                    if orig_idx is not None:
+                        self.app.root.after(0, self.app.highlight_event, orig_idx)
+                except Exception:
+                    pass
+
+            if self.stop_event.is_set() or n_actions == 0:
+                break
+
+            # Completed one full pass. Loop again if the user asked to repeat.
+            if self.loop_count == 1 or (self.loop_count != 0 and self.loop_iteration >= self.loop_count):
+                break
+
+            self.loop_iteration += 1
+            self.timeline_idx = 0
+            self.playback_elapsed_s = 0.0
+            self.playback_start_real_time = time.time()
+            self.app.root.after(0, self.app.on_loop_iteration)
 
         # Finished or interrupted
-        self.app.root.after(0, self.stop)
+        self.app.root.after(0, self._finish, generation)
+
+    def _resolve_key_obj(self, key_val, is_special):
+        if is_special:
+            if isinstance(key_val, str) and key_val.startswith("vk_"):
+                # Combos with no printable char (e.g. Ctrl+<digit>) are recorded
+                # by raw virtual-key code rather than a Key enum name.
+                vk = int(key_val.split("_", 1)[1])
+                return pynput.keyboard.KeyCode(vk=vk)
+            return getattr(pynput.keyboard.Key, key_val)
+        return key_val
 
     def _execute_action(self, action):
         act_type = action["action"]
@@ -245,7 +448,7 @@ class PlaybackController:
                 key_val = event.get("key")
                 is_special = event.get("special", False)
                 try:
-                    key_obj = getattr(pynput.keyboard.Key, key_val) if is_special else key_val
+                    key_obj = self._resolve_key_obj(key_val, is_special)
                     self.keyboard_controller.press(key_obj)
                     self.simulated_pressed_keys.add(key_obj)
                 except Exception as e:
@@ -268,7 +471,7 @@ class PlaybackController:
                 key_val = event.get("key")
                 is_special = event.get("special", False)
                 try:
-                    key_obj = getattr(pynput.keyboard.Key, key_val) if is_special else key_val
+                    key_obj = self._resolve_key_obj(key_val, is_special)
                     self.keyboard_controller.release(key_obj)
                     self.simulated_pressed_keys.discard(key_obj)
                 except Exception as e:
@@ -290,6 +493,17 @@ class PlaybackController:
             except Exception as e:
                 print(f"Error moving mouse: {e}")
 
+        elif act_type == "raw_move":
+            dx = event.get("dx", 0)
+            dy = event.get("dy", 0)
+            try:
+                # Relative SendInput move (not pynput's move(), which is just
+                # SetCursorPos) so it feeds into the raw input pipeline the
+                # way mouse-look games (e.g. Minecraft) expect.
+                send_relative_mouse_move(dx, dy)
+            except Exception as e:
+                print(f"Error applying raw mouse delta: {e}")
+
 
 class MacroApp:
     def __init__(self, root):
@@ -302,9 +516,17 @@ class MacroApp:
         self.sessions_data = {"sessions": []}
         self.current_session = None
         self.recording_active = False
+        # True during the short delay between pressing Record and the hooks
+        # actually starting, so a second F9 can't start recording twice.
+        self.recording_pending = False
+
+        # Recording callbacks run on pynput's hook threads while stopping runs
+        # on the Tk thread, so all recording state is guarded by this lock.
+        self.record_lock = threading.Lock()
 
         # Recording temporary states
         self.recorded_events = []
+        self.recording_start_time = None
         self.last_event_time = None
         self.pressed_keys = {}
         self.pressed_mouse = {}
@@ -314,11 +536,21 @@ class MacroApp:
         # Mouse Listener
         self.mouse_listener = None
 
+        # Raw mouse input state (for game/FPS camera capture). Deltas that
+        # arrive between samples are summed here rather than dropped.
+        self.last_raw_move_time = 0
+        self.pending_raw_dx = 0
+        self.pending_raw_dy = 0
+
+        # Event table row currently highlighted during playback
+        self.highlighted_event_item = None
+
         # Playback Controller
         self.playback_controller = PlaybackController(self)
 
         self.load_data()
         self.setup_styles()
+        self._init_raw_mouse_input()
         self.create_widgets()
 
         # Start permanent global keyboard listener
@@ -327,22 +559,207 @@ class MacroApp:
         if self.sessions_data["sessions"]:
             self.select_session(self.sessions_data["sessions"][0]["id"])
 
+        self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
+
+    # ==================== RAW MOUSE INPUT (GAME CAPTURE) ====================
+
+    def _init_raw_mouse_input(self):
+        """Subclass this window's WNDPROC to intercept WM_INPUT so we can read
+        raw relative mouse deltas - the same channel FPS-style games read for
+        camera look - instead of only the OS cursor's absolute position."""
+        self.raw_mouse_input_available = False
+        self._raw_wndproc_ref = None
+        self._raw_old_wndproc = None
+        try:
+            self.root.update_idletasks()
+            hwnd = self.root.winfo_id()
+
+            self._raw_wndproc_ref = WNDPROC(self._wnd_proc)
+            old_wndproc = _user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, self._raw_wndproc_ref)
+            if not old_wndproc:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._raw_old_wndproc = old_wndproc
+
+            device = RAWINPUTDEVICE(
+                usUsagePage=HID_USAGE_PAGE_GENERIC,
+                usUsage=HID_USAGE_GENERIC_MOUSE,
+                dwFlags=RIDEV_INPUTSINK,
+                hwndTarget=hwnd,
+            )
+            if not _user32.RegisterRawInputDevices(ctypes.byref(device), 1, ctypes.sizeof(device)):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            self.raw_mouse_input_available = True
+        except Exception as e:
+            print(f"Raw mouse input unavailable: {e}")
+            # Restore the original wndproc if we managed to install ours
+            # before something else failed.
+            if self._raw_old_wndproc:
+                try:
+                    _user32.SetWindowLongPtrW(self.root.winfo_id(), GWLP_WNDPROC, self._raw_old_wndproc)
+                except Exception:
+                    pass
+            self._raw_old_wndproc = None
+            self._raw_wndproc_ref = None
+
+    def _wnd_proc(self, hwnd, msg, wparam, lparam):
+        # This runs inside Tkinter's native message loop. It must never raise
+        # or block, and must always forward to the original wndproc, or the
+        # whole GUI (not just recording) will misbehave or hang.
+        if msg == WM_INPUT:
+            try:
+                self._handle_raw_input(lparam)
+            except Exception:
+                pass
+        return _user32.CallWindowProcW(self._raw_old_wndproc, hwnd, msg, wparam, lparam)
+
+    def _handle_raw_input(self, lparam):
+        size = wintypes.UINT(0)
+        _user32.GetRawInputData(lparam, RID_INPUT, None, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER))
+        if size.value == 0:
+            return
+
+        buf = ctypes.create_string_buffer(size.value)
+        copied = _user32.GetRawInputData(lparam, RID_INPUT, buf, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER))
+        if copied != size.value:
+            return
+
+        raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
+        if raw.header.dwType != RIM_TYPEMOUSE:
+            return
+        # Remote Desktop, VMs and pen tablets report absolute positions
+        # (0-65535) here instead of relative deltas. Treating those as deltas
+        # would record huge camera jumps, so skip them.
+        if raw.mouse.usFlags & MOUSE_MOVE_ABSOLUTE:
+            return
+
+        dx, dy = raw.mouse.lLastX, raw.mouse.lLastY
+        if dx or dy:
+            self._on_raw_mouse_delta(dx, dy)
+
+    def _on_raw_mouse_delta(self, dx, dy):
+        if self.mouse_move_mode.get() != "raw":
+            return
+
+        with self.record_lock:
+            if not self.recording_active:
+                return
+
+            self.pending_raw_dx += dx
+            self.pending_raw_dy += dy
+
+            now = time.time()
+            # Cap sampling rate to 125 Hz to keep recordings a sane size. The
+            # deltas in between are accumulated, not dropped, so the total
+            # movement still matches what the mouse actually did.
+            if now - self.last_raw_move_time < 0.008:
+                return
+            self._flush_raw_move(now)
+
+    def _flush_raw_move(self, now):
+        # Caller must hold record_lock.
+        if not (self.pending_raw_dx or self.pending_raw_dy):
+            return
+        self.last_raw_move_time = now
+
+        interval = (now - self.last_event_time) * 1000.0 if self.last_event_time is not None else 0.0
+        move_time_ms = 0.0
+        if self.recording_start_time is not None:
+            move_time_ms = max(0.0, (now - self.recording_start_time) * 1000.0)
+
+        self.recorded_events.append({
+            "event": "raw_move",
+            "dx": int(self.pending_raw_dx),
+            "dy": int(self.pending_raw_dy),
+            "interval_ms": interval,
+            "time_ms": move_time_ms
+        })
+        self.pending_raw_dx = 0
+        self.pending_raw_dy = 0
+        self.last_event_time = now
+
+    def on_app_close(self):
+        # Restore the original wndproc before Tk tears the window down, so no
+        # WM_INPUT can ever call back into a Python callback after shutdown
+        # starts.
+        if self._raw_old_wndproc:
+            try:
+                _user32.SetWindowLongPtrW(self.root.winfo_id(), GWLP_WNDPROC, self._raw_old_wndproc)
+            except Exception:
+                pass
+        self.root.destroy()
+
+    def _normalize_key(self, key):
+        """Return a stable (is_special, key_name) identity for matching key press/release pairs."""
+        is_special = not hasattr(key, 'char') or key.char is None
+        if is_special:
+            # Key enum members (arrows, ctrl, f-keys, etc.) always have `.name`.
+            # But some combos - e.g. Ctrl+<digit>, dead keys, some Alt combos -
+            # report a plain KeyCode with char=None instead, which has no
+            # `.name` attribute. Accessing key.name there used to raise
+            # AttributeError, which pynput propagates out of the listener
+            # thread and silently kills the *entire* global hotkey/recording
+            # listener for the rest of the app's life. Fall back to the raw
+            # virtual-key code instead of crashing.
+            key_name = getattr(key, 'name', None)
+            if key_name is None:
+                vk = getattr(key, 'vk', None)
+                key_name = f"vk_{vk}" if vk is not None else "unknown"
+        else:
+            key_name = key.char
+            if isinstance(key_name, str) and len(key_name) == 1 and 0 < ord(key_name) < 27:
+                # Holding Ctrl turns the letter key's reported char into a control
+                # character (e.g. Ctrl+V -> '\x16') instead of the literal letter.
+                # Recover the letter so playback re-presses it while Ctrl is held,
+                # instead of injecting a raw control character that most apps ignore.
+                key_name = chr(ord(key_name) + 96)
+        return is_special, key_name
+
+    def _key_identity_token(self, key):
+        """Build a stable token for key press/release matching across layout/modifier variance."""
+        is_special, key_name = self._normalize_key(key)
+        if is_special:
+            return ("special", key_name)
+
+        vk = getattr(key, 'vk', None)
+        if vk is not None:
+            return ("vk", int(vk))
+
+        if isinstance(key_name, str):
+            return ("char", key_name.lower())
+
+        return ("char", key_name)
+
     def load_data(self):
         if os.path.exists(self.recordings_file):
             try:
                 with open(self.recordings_file, 'r', encoding='utf-8') as f:
                     self.sessions_data = json.load(f)
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to load recordings: {e}\nCreating a new empty file.")
+                # Move the unreadable file aside before starting fresh, so the
+                # next save can't overwrite (and permanently lose) it.
+                backup_path = f"{self.recordings_file}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+                try:
+                    os.replace(self.recordings_file, backup_path)
+                    backup_note = f"The unreadable file was kept as:\n{backup_path}"
+                except OSError:
+                    backup_note = "The unreadable file could not be backed up."
+                messagebox.showerror("Error", f"Failed to load recordings: {e}\n\n{backup_note}\n\nStarting with an empty list.")
                 self.sessions_data = {"sessions": []}
         else:
             self.sessions_data = {"sessions": []}
             self.save_data()
 
     def save_data(self):
+        # Write to a temp file and swap it in, so a crash mid-save leaves the
+        # previous recordings file intact instead of half-written.
+        tmp_path = self.recordings_file + ".tmp"
         try:
-            with open(self.recordings_file, 'w', encoding='utf-8') as f:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(self.sessions_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.recordings_file)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save recordings: {e}")
 
@@ -392,8 +809,16 @@ class MacroApp:
         self.style.configure('TCheckbutton', background=self.bg_primary, foreground=self.fg_primary)
         self.style.map('TCheckbutton', background=[('active', self.bg_primary)])
 
+        # Radiobutton
+        self.style.configure('TRadiobutton', background=self.bg_primary, foreground=self.fg_primary)
+        self.style.map('TRadiobutton', background=[('active', self.bg_primary)])
+
+        # Input fields (white field background, so use black text)
+        for input_style in ('TEntry', 'TSpinbox', 'TCombobox'):
+            self.style.configure(input_style, foreground='#000000', fieldbackground='#ffffff', insertcolor='#000000')
+
         # Treeview (Table)
-        self.style.configure('Treeview', background=self.bg_secondary, foreground=self.fg_primary, fieldbackground=self.bg_secondary, rowheight=24, borderwidth=0)
+        self.style.configure('Treeview',background=self.bg_secondary, foreground=self.fg_primary, fieldbackground=self.bg_secondary, rowheight=24, borderwidth=0)
         self.style.map('Treeview', background=[('selected', self.accent_blue)], foreground=[('selected', '#ffffff')])
         self.style.configure('Treeview.Heading', background=self.bg_tertiary, foreground=self.fg_primary, relief='flat', font=('Segoe UI', 9, 'bold'))
         self.style.map('Treeview.Heading', background=[('active', '#4e4e50')])
@@ -471,23 +896,43 @@ class MacroApp:
 
         self.opt_record_keys = tk.BooleanVar(value=True)
         self.opt_record_clicks = tk.BooleanVar(value=True)
-        self.opt_record_movement = tk.BooleanVar(value=False)
+        self.mouse_move_mode = tk.StringVar(value="off")
         self.opt_minimize_on_record = tk.BooleanVar(value=True)
 
         ttk.Checkbutton(recording_options_frame, text="Log Keyboard Keys", variable=self.opt_record_keys).pack(anchor='w', pady=2)
         ttk.Checkbutton(recording_options_frame, text="Log Mouse Clicks", variable=self.opt_record_clicks).pack(anchor='w', pady=2)
-        ttk.Checkbutton(recording_options_frame, text="Track Mouse Movement (Raw)", variable=self.opt_record_movement).pack(anchor='w', pady=2)
-        ttk.Checkbutton(recording_options_frame, text="Minimize Window on Record", variable=self.opt_minimize_on_record).pack(anchor='w', pady=2)
+
+        ttk.Label(recording_options_frame, text="Mouse Movement Tracking:").pack(anchor='w', pady=(8, 0))
+        ttk.Radiobutton(recording_options_frame, text="Off", variable=self.mouse_move_mode, value="off").pack(anchor='w')
+        ttk.Radiobutton(recording_options_frame, text="Cursor Position (desktop apps)", variable=self.mouse_move_mode, value="cursor").pack(anchor='w')
+        ttk.Radiobutton(recording_options_frame, text="Raw Input Delta (games / FPS camera)", variable=self.mouse_move_mode, value="raw", state='normal' if self.raw_mouse_input_available else 'disabled').pack(anchor='w')
+        if not self.raw_mouse_input_available:
+            ttk.Label(recording_options_frame, text="(Raw input hook unavailable on this system)", foreground=self.fg_secondary).pack(anchor='w')
+
+        ttk.Checkbutton(recording_options_frame, text="Minimize Window on Record", variable=self.opt_minimize_on_record).pack(anchor='w', pady=(8, 2))
 
         # Playback Settings
         playback_options_frame = ttk.LabelFrame(controls_card, text=" Playback Settings ", padding=10)
         playback_options_frame.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
 
-        ttk.Label(playback_options_frame, text="Playback Speed Multiplier:").pack(anchor='w', pady=2)
+        ttk.Label(playback_options_frame, text="Playback Speed Multiplier (x):").pack(anchor='w', pady=2)
 
+        # No "x" suffix in the format: the spinbox text has to stay a plain
+        # number or speed_var.get() fails and Play stops working.
         self.speed_var = tk.DoubleVar(value=1.0)
-        speed_spin = ttk.Spinbox(playback_options_frame, from_=0.1, to=10.0, increment=0.1, format="%.1fx", textvariable=self.speed_var, width=10)
+        speed_spin = ttk.Spinbox(playback_options_frame, from_=0.1, to=10.0, increment=0.1, format="%.1f", textvariable=self.speed_var, width=10)
         speed_spin.pack(anchor='w', pady=2)
+
+        ttk.Separator(playback_options_frame, orient='horizontal').pack(fill='x', pady=8)
+
+        self.opt_loop_playback = tk.BooleanVar(value=False)
+        ttk.Checkbutton(playback_options_frame, text="Loop Playback", variable=self.opt_loop_playback).pack(anchor='w', pady=2)
+
+        loop_row = ttk.Frame(playback_options_frame)
+        loop_row.pack(anchor='w', fill='x', pady=2)
+        ttk.Label(loop_row, text="Repeat Count (0 = infinite):").pack(side='left')
+        self.loop_count_var = tk.IntVar(value=0)
+        ttk.Spinbox(loop_row, from_=0, to=9999, increment=1, textvariable=self.loop_count_var, width=6).pack(side='left', padx=(5, 0))
 
         # Main Controller Buttons (Rec, Stop, Play, Pause, Clear)
         buttons_frame = ttk.Frame(main_content, padding=10)
@@ -535,6 +980,7 @@ class MacroApp:
         self.event_tree.column('hold', width=110, minwidth=100, anchor='e')
 
         self.event_tree.grid(row=0, column=0, sticky='nsew')
+        self.event_tree.tag_configure('playing', background='#104e8b', foreground='#ffffff')
 
         # Scrollbars for table
         tbl_scroll_y = ttk.Scrollbar(table_frame, orient='vertical', command=self.event_tree.yview)
@@ -565,12 +1011,21 @@ class MacroApp:
         self.global_keyboard_listener.start()
 
     def _global_on_press(self, key):
+        # This callback runs inside pynput's global low-level keyboard hook
+        # thread, on EVERY keystroke made anywhere on the system for the
+        # entire lifetime of the app. If anything raises here, pynput kills
+        # the whole listener permanently (it is only started once, in
+        # __init__) - silently disabling F7-F10 and recording capture for the
+        # rest of the session with no visible error. Never let an exception
+        # escape this method.
+        try:
+            self._handle_global_on_press(key)
+        except Exception as e:
+            print(f"Error in global key handler: {e}")
+
+    def _handle_global_on_press(self, key):
         # Tiny yield to avoid starving other threads over long runs
         time.sleep(0.0001)
-
-        # Determine the key identifier
-        is_special = not hasattr(key, 'char') or key.char is None
-        key_name = key.name if is_special else key.char
 
         # A: Active Recording State
         if self.recording_active:
@@ -603,6 +1058,12 @@ class MacroApp:
                 self.root.after(0, self.on_play)
 
     def _global_on_release(self, key):
+        try:
+            self._handle_global_on_release(key)
+        except Exception as e:
+            print(f"Error in global key release handler: {e}")
+
+    def _handle_global_on_release(self, key):
         if self.recording_active:
             self._on_key_release(key)
 
@@ -639,6 +1100,7 @@ class MacroApp:
 
     def refresh_event_table(self):
         # Clear table
+        self.highlighted_event_item = None
         for item in self.event_tree.get_children():
             self.event_tree.delete(item)
 
@@ -656,6 +1118,9 @@ class MacroApp:
                 details = f"{ev.get('button').upper()} Click at ({int(ev.get('x', 0))}, {int(ev.get('y', 0))})"
             elif ev_type == "Move":
                 details = f"Move to ({int(ev.get('x', 0))}, {int(ev.get('y', 0))})"
+            elif ev_type == "Raw_move":
+                ev_type = "Raw Move"
+                details = f"Raw delta ({int(ev.get('dx', 0))}, {int(ev.get('dy', 0))})"
             else:
                 details = "-"
 
@@ -666,7 +1131,10 @@ class MacroApp:
 
     def update_ui_state(self):
         has_session = self.current_session is not None
-        has_events = has_session and len(self.current_session.get("events", [])) > 0
+        current_events = []
+        if has_session and isinstance(self.current_session, dict):
+            current_events = self.current_session.get("events", [])
+        has_events = len(current_events) > 0
         is_playing = self.playback_controller.playing
         is_paused = self.playback_controller.paused
 
@@ -761,8 +1229,9 @@ class MacroApp:
     # ==================== RECORDING LOGIC ====================
 
     def on_start_recording(self):
-        if not self.current_session or self.recording_active:
+        if not self.current_session or self.recording_active or self.recording_pending or self.playback_controller.playing:
             return
+        self.recording_pending = True
 
         # Optional window minimization to keep screen clean
         if self.opt_minimize_on_record.get():
@@ -772,29 +1241,38 @@ class MacroApp:
         self.root.after(500, self._start_hooks)
 
     def _start_hooks(self):
-        self.recording_active = True
+        self.recording_pending = False
+
+        with self.record_lock:
+            self.recorded_events = []
+            self.recording_start_time = time.time()
+            self.last_event_time = time.time()  # Start interval calculation now
+            self.pressed_keys.clear()
+            self.pressed_mouse.clear()
+            self.last_move_time = 0
+            self.last_move_pos = None
+            self.last_raw_move_time = 0
+            self.pending_raw_dx = 0
+            self.pending_raw_dy = 0
+            self.recording_active = True
+
         self.status_var.set("Recording (F10 to stop)")
         self.update_ui_state()
 
-        self.recorded_events = []
-        self.last_event_time = time.time()  # Start interval calculation now
-        self.pressed_keys.clear()
-        self.pressed_mouse.clear()
-        self.last_move_time = 0
-        self.last_move_pos = None
+        track_cursor = self.mouse_move_mode.get() == "cursor"
 
-        # Start mouse hook if enabled
-        if self.opt_record_clicks.get() or self.opt_record_movement.get():
+        # Start mouse hook if enabled. Raw-delta tracking doesn't need this
+        # listener - it's fed independently by the WM_INPUT window hook.
+        if self.opt_record_clicks.get() or track_cursor:
             self.mouse_listener = pynput.mouse.Listener(
                 on_click=self._on_mouse_click if self.opt_record_clicks.get() else None,
-                on_move=self._on_mouse_move if self.opt_record_movement.get() else None
+                on_move=self._on_mouse_move if track_cursor else None
             )
             self.mouse_listener.start()
 
     def _on_key_press(self, key):
         # Exclude control hotkeys from being logged
-        is_special = not hasattr(key, 'char') or key.char is None
-        key_name = key.name if is_special else key.char
+        is_special, key_name = self._normalize_key(key)
 
         if key_name in ['f7', 'f8', 'f9', 'f10']:
             return
@@ -802,28 +1280,56 @@ class MacroApp:
         if not self.opt_record_keys.get():
             return
 
-        # Prevent repeat press events from OS
-        if key in self.pressed_keys:
-            return
+        key_token = self._key_identity_token(key)
+        with self.record_lock:
+            if not self.recording_active:
+                return
 
-        now = time.time()
-        self.pressed_keys[key] = now
+            # Prevent repeat press events from OS
+            if key_token in self.pressed_keys:
+                return
+
+            now = time.time()
+            self.pressed_keys[key_token] = {
+                "press_time": now,
+                "is_special": is_special,
+                "key_name": key_name,
+            }
 
     def _on_key_release(self, key):
         # Exclude control hotkeys from being logged
-        is_special = not hasattr(key, 'char') or key.char is None
-        key_name = key.name if is_special else key.char
+        is_special, key_name = self._normalize_key(key)
 
         if key_name in ['f7', 'f8', 'f9', 'f10']:
             return
 
-        if not self.recording_active or not self.opt_record_keys.get():
+        if not self.opt_record_keys.get():
             return
 
-        if key in self.pressed_keys:
-            press_time = self.pressed_keys.pop(key)
+        key_token = self._key_identity_token(key)
+        with self.record_lock:
+            if not self.recording_active:
+                return
+            self._record_key_release(key_token, is_special, key_name)
+
+    def _record_key_release(self, key_token, is_special, key_name):
+        # Caller must hold record_lock.
+        # Fallback for environments where release key char case differs from press key char.
+        if key_token not in self.pressed_keys and not is_special and isinstance(key_name, str):
+            key_token = ("char", key_name.lower())
+
+        if key_token in self.pressed_keys:
+            pressed_info = self.pressed_keys.pop(key_token)
+            press_time = pressed_info["press_time"]
+            is_special = pressed_info["is_special"]
+            key_name = pressed_info["key_name"]
             now = time.time()
             hold = (now - press_time) * 1000.0
+            start_ms = 0.0
+            end_ms = 0.0
+            if self.recording_start_time is not None:
+                start_ms = max(0.0, (press_time - self.recording_start_time) * 1000.0)
+                end_ms = max(start_ms, (now - self.recording_start_time) * 1000.0)
 
             # Calculate overlapping interval relative to last event's release
             interval = (press_time - self.last_event_time) * 1000.0 if self.last_event_time is not None else 0.0
@@ -833,14 +1339,19 @@ class MacroApp:
                 "key": key_name,
                 "special": is_special,
                 "hold_ms": hold,
-                "interval_ms": interval
+                "interval_ms": interval,
+                "start_ms": start_ms,
+                "end_ms": end_ms
             })
             self.last_event_time = now
 
     def _on_mouse_click(self, x, y, button, pressed):
-        if not self.recording_active:
-            return
+        with self.record_lock:
+            if self.recording_active:
+                self._record_mouse_click(x, y, button, pressed)
 
+    def _record_mouse_click(self, x, y, button, pressed):
+        # Caller must hold record_lock.
         now = time.time()
         if pressed:
             self.pressed_mouse[button] = (now, x, y)
@@ -848,6 +1359,11 @@ class MacroApp:
             if button in self.pressed_mouse:
                 press_time, px, py = self.pressed_mouse.pop(button)
                 hold = (now - press_time) * 1000.0
+                start_ms = 0.0
+                end_ms = 0.0
+                if self.recording_start_time is not None:
+                    start_ms = max(0.0, (press_time - self.recording_start_time) * 1000.0)
+                    end_ms = max(start_ms, (now - self.recording_start_time) * 1000.0)
 
                 # Calculate overlapping interval relative to last event's release
                 interval = (press_time - self.last_event_time) * 1000.0 if self.last_event_time is not None else 0.0
@@ -858,25 +1374,34 @@ class MacroApp:
                     "x": float(px),
                     "y": float(py),
                     "hold_ms": hold,
-                    "interval_ms": interval
+                    "interval_ms": interval,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms
                 })
                 self.last_event_time = now
 
     def _on_mouse_move(self, x, y):
-        if not self.recording_active:
-            return
+        with self.record_lock:
+            if self.recording_active:
+                self._record_mouse_move(x, y)
 
+    def _record_mouse_move(self, x, y):
+        # Caller must hold record_lock.
         now = time.time()
         # Cap sampling rate to 50 Hz (20ms interval) to avoid massive log files and filter minimal vibrations
         if now - self.last_move_time >= 0.02:
             if self.last_move_pos is None or (abs(x - self.last_move_pos[0]) > 3 or abs(y - self.last_move_pos[1]) > 3):
                 interval = (now - self.last_event_time) * 1000.0 if self.last_event_time is not None else 0.0
+                move_time_ms = 0.0
+                if self.recording_start_time is not None:
+                    move_time_ms = max(0.0, (now - self.recording_start_time) * 1000.0)
 
                 self.recorded_events.append({
                     "event": "move",
                     "x": float(x),
                     "y": float(y),
-                    "interval_ms": interval
+                    "interval_ms": interval,
+                    "time_ms": move_time_ms
                 })
                 self.last_event_time = now
                 self.last_move_time = now
@@ -892,7 +1417,43 @@ class MacroApp:
             self.playback_controller.stop()
 
     def _stop_recording(self):
-        self.recording_active = False
+        # Flip the flag and finalize under the lock, so no hook-thread
+        # callback can modify pressed_keys/recorded_events while we read them.
+        with self.record_lock:
+            self.recording_active = False
+
+            # Record any raw mouse movement still waiting to be sampled
+            now = time.time()
+            self._flush_raw_move(now)
+
+            # Clean up any leftover keys that were pressed during recording but not released before stopping
+            for pressed_info in self.pressed_keys.values():
+                press_time = pressed_info["press_time"]
+                hold = (now - press_time) * 1000.0
+                is_special = pressed_info["is_special"]
+                key_name = pressed_info["key_name"]
+                start_ms = 0.0
+                end_ms = 0.0
+                if self.recording_start_time is not None:
+                    start_ms = max(0.0, (press_time - self.recording_start_time) * 1000.0)
+                    end_ms = max(start_ms, (now - self.recording_start_time) * 1000.0)
+
+                # Exclude control hotkeys from the recording list
+                if key_name not in ['f7', 'f8', 'f9', 'f10']:
+                    interval = (press_time - self.last_event_time) * 1000.0 if self.last_event_time is not None else 0.0
+                    self.recorded_events.append({
+                        "event": "key",
+                        "key": key_name,
+                        "special": is_special,
+                        "hold_ms": hold,
+                        "interval_ms": interval,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms
+                    })
+                    self.last_event_time = now
+
+            self.pressed_keys.clear()
+            self.pressed_mouse.clear()
 
         # Stop Mouse Listener
         if self.mouse_listener:
@@ -902,24 +1463,10 @@ class MacroApp:
                 pass
             self.mouse_listener = None
 
-        # Clean up any leftover keys that were pressed during recording but not released before stopping
-        now = time.time()
-        for key, press_time in self.pressed_keys.items():
-            hold = (now - press_time) * 1000.0
-            is_special = not hasattr(key, 'char') or key.char is None
-            key_name = key.name if is_special else key.char
-
-            # Exclude control hotkeys from the recording list
-            if key_name not in ['f7', 'f8', 'f9', 'f10']:
-                interval = (press_time - self.last_event_time) * 1000.0 if self.last_event_time is not None else 0.0
-                self.recorded_events.append({
-                    "event": "key",
-                    "key": key_name,
-                    "special": is_special,
-                    "hold_ms": hold,
-                    "interval_ms": interval
-                })
-                self.last_event_time = now
+        if not self.current_session:
+            self.status_var.set("Status: Idle")
+            self.update_ui_state()
+            return
 
         # Append new events to current session
         self.current_session["events"].extend(self.recorded_events)
@@ -941,15 +1488,66 @@ class MacroApp:
         messagebox.showinfo("Recording Finished", f"Successfully recorded {len(self.recorded_events)} events!")
 
     def on_play(self):
-        if not self.current_session or not self.current_session.get("events") or self.playback_controller.playing:
+        if (not self.current_session or not self.current_session.get("events")
+                or self.playback_controller.playing or self.recording_active or self.recording_pending):
             return
 
-        self.status_var.set("Playing")
-        self.update_ui_state()
+        speed = self._read_speed()
+        if speed is None:
+            return
+
+        loop_count = 1
+        if self.opt_loop_playback.get():
+            loop_count = self._read_loop_count()
+            if loop_count is None:
+                return
+
         self.playback_controller.start(
             self.current_session["events"],
-            speed_multiplier=self.speed_var.get()
+            speed_multiplier=speed,
+            loop_count=loop_count
         )
+        self.status_var.set("Playing" + self._loop_status_suffix())
+        self.update_ui_state()
+
+    def _read_speed(self):
+        """Return the speed multiplier clamped to 0.1-10, or None (after
+        telling the user) if the box doesn't hold a positive number."""
+        try:
+            speed = float(self.speed_var.get())
+        except (tk.TclError, ValueError):
+            speed = 0.0
+        if not speed > 0:
+            messagebox.showerror("Invalid Speed", "Playback speed must be a number greater than 0 (for example 1.0).")
+            self.speed_var.set(1.0)
+            return None
+        speed = min(max(speed, 0.1), 10.0)
+        self.speed_var.set(round(speed, 2))
+        return speed
+
+    def _read_loop_count(self):
+        """Return the repeat count (0 = infinite), or None (after telling the
+        user) if the box doesn't hold a whole number."""
+        try:
+            count = int(self.loop_count_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Invalid Repeat Count", "Repeat count must be a whole number (0 = infinite).")
+            self.loop_count_var.set(0)
+            return None
+        count = max(0, count)
+        self.loop_count_var.set(count)
+        return count
+
+    def _loop_status_suffix(self):
+        pc = self.playback_controller
+        if pc.loop_count == 1:
+            return ""
+        if pc.loop_count == 0:
+            return f" (Loop {pc.loop_iteration})"
+        return f" (Loop {pc.loop_iteration}/{pc.loop_count})"
+
+    def on_loop_iteration(self):
+        self.status_var.set("Playing" + self._loop_status_suffix())
 
     def on_pause(self):
         if self.playback_controller.playing:
@@ -959,34 +1557,39 @@ class MacroApp:
                 self.playback_controller.pause()
 
     def on_playback_paused(self):
-        self.status_var.set("Paused")
+        self.status_var.set("Paused" + self._loop_status_suffix())
         self.update_ui_state()
 
     def on_playback_resumed(self):
-        self.status_var.set("Playing")
+        self.status_var.set("Playing" + self._loop_status_suffix())
         self.update_ui_state()
 
     def on_playback_stopped(self):
         self.status_var.set("Status: Idle")
-        # Clear Treeview highlighters
-        for item in self.event_tree.get_children():
-            self.event_tree.item(item, tags=())
+        # Clear Treeview highlighter
+        self._clear_event_highlight()
 
         self.update_ui_state()
 
-    def highlight_event(self, idx):
-        # Highlight current playing event row
-        item_id = f"ev_{idx}"
-        if self.event_tree.exists(item_id):
-            # Remove highlighters from others
-            for item in self.event_tree.get_children():
-                if item == item_id:
-                    self.event_tree.item(item, tags=('playing',))
-                else:
-                    self.event_tree.item(item, tags=())
+    def _clear_event_highlight(self):
+        item = self.highlighted_event_item
+        self.highlighted_event_item = None
+        if item and self.event_tree.exists(item):
+            self.event_tree.item(item, tags=())
 
-            self.event_tree.tag_configure('playing', background='#104e8b', foreground='#ffffff')
-            self.event_tree.see(item_id)
+    def highlight_event(self, idx):
+        # Highlight current playing event row. Only the previous and new rows
+        # are touched, so long macros don't re-tag every row per action.
+        if not self.playback_controller.playing:
+            return
+        item_id = f"ev_{idx}"
+        if item_id == self.highlighted_event_item or not self.event_tree.exists(item_id):
+            return
+
+        self._clear_event_highlight()
+        self.event_tree.item(item_id, tags=('playing',))
+        self.highlighted_event_item = item_id
+        self.event_tree.see(item_id)
 
     # ==================== TABLE / EDITOR EVENTS ====================
 
@@ -1026,12 +1629,7 @@ class MacroApp:
 
 
 if __name__ == "__main__":
-    # Ensure Tkinter runs cleanly on high DPI screens
-    try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
+    set_dpi_awareness()
 
     root = tk.Tk()
     app = MacroApp(root)
